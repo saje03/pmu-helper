@@ -25,7 +25,7 @@ def get_participants(date_str, r, c):
 
 
 def parse_music(music):
-    """Turn PMU 'musique' like '1p3p0p2a' into list of finishing places."""
+    """Turn PMU 'musique' like '1p3p0p2a' into finishing places."""
     places = []
     for ch in (music or ""):
         if ch.isdigit():
@@ -33,66 +33,70 @@ def parse_music(music):
     return places
 
 
-def score_horse(p):
-    """Higher score = more likely to finish in the top 3."""
+def get_odds(p):
+    for key in ("dernierRapportDirect", "dernierRapportReference"):
+        try:
+            v = p[key]["rapport"]
+            if v and v > 0:
+                return float(v)
+        except Exception:
+            pass
+    return None
+
+
+def safety_score(p, race_distance=None):
+    """0-100. Higher = safer bet to finish in the top 3."""
+    if p.get("statut") and p["statut"] != "PARTANT":
+        return -1.0
+
     score = 0.0
 
-    # 1. Market odds (lower odds = market favourite)
-    odds = None
-    try:
-        odds = p["dernierRapportDirect"]["rapport"]
-    except Exception:
-        try:
-            odds = p["dernierRapportReference"]["rapport"]
-        except Exception:
-            odds = None
-    if odds and odds > 0:
-        score += 50.0 / odds  # implied probability weight
+    # 1. Market odds: implied chance (max 45 points)
+    odds = get_odds(p)
+    if odds:
+        score += min(45.0, 45.0 * (3.0 / odds))
 
-    # 2. Recent form from 'musique' (last 6 runs)
+    # 2. Recent form: weighted top-3 rate, recent runs count more (max 30)
     places = parse_music(p.get("musique"))[:6]
     if places:
-        top3 = sum(1 for x in places if 1 <= x <= 3)
-        score += 8.0 * (top3 / len(places))
+        weights = [6, 5, 4, 3, 2, 1][: len(places)]
+        got = sum(w for w, x in zip(weights, places) if 1 <= x <= 3)
+        score += 30.0 * got / sum(weights)
 
-    # 3. Career place rate
+    # 3. Career top-3 rate (max 15)
     runs = p.get("nombreCourses") or 0
-    places_count = p.get("nombrePlaces") or 0
-    wins = p.get("nombreVictoires") or 0
     if runs >= 3:
-        score += 6.0 * ((wins + places_count) / runs)
+        top3 = (p.get("nombreVictoires") or 0) + (p.get("nombrePlaces") or 0)
+        score += 15.0 * min(1.0, top3 / runs)
 
-    # 4. Penalise non-runners
-    if p.get("statut") and p["statut"] != "PARTANT":
-        score = -999
+    # 4. Consistency: no disqualification (D) in last 6 runs (max 10)
+    music = (p.get("musique") or "")[:12].upper()
+    if "D" not in music:
+        score += 10.0
 
-    return score, odds
+    return round(score, 1)
 
 
 def rank_race(date_str, r, c):
     rows = []
     for p in get_participants(date_str, r, c):
-        score, odds = score_horse(p)
+        s = safety_score(p)
         rows.append({
             "Number": p.get("numPmu"),
             "Horse": p.get("nom"),
             "Jockey/Driver": p.get("driver") or p.get("jockey"),
-            "Trainer": p.get("entraineur"),
             "Form": p.get("musique"),
-            "Runs": p.get("nombreCourses"),
-            "Wins": p.get("nombreVictoires"),
-            "Places": p.get("nombrePlaces"),
-            "Odds": odds,
-            "Score": round(score, 2),
+            "Odds": get_odds(p),
+            "Safety": s,
         })
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+        df = df[df["Safety"] >= 0]
+        df = df.sort_values("Safety", ascending=False).reset_index(drop=True)
     return df
 
 
 def get_results(date_str, r, c):
-    """Return the first three finishers (numbers) of a finished race."""
     try:
         data = get_json(f"{BASE}/{date_str}/R{r}/C{c}")
         arrivee = data.get("ordreArrivee") or []
@@ -102,9 +106,23 @@ def get_results(date_str, r, c):
         return []
 
 
+def confidence_label(df):
+    """Is the anchor clearly safer than the rest?"""
+    if len(df) < 2:
+        return "n/a"
+    gap = df.iloc[0]["Safety"] - df.iloc[1]["Safety"]
+    top = df.iloc[0]["Safety"]
+    if top >= 60 and gap >= 8:
+        return "STRONG anchor"
+    if top >= 50:
+        return "OK anchor"
+    return "WEAK - skip this race"
+
+
 # ---------------- UI ----------------
-st.set_page_config(page_title="PMU Place Helper", layout="wide")
-st.title("PMU Place Helper")
+st.set_page_config(page_title="PMU Anchor Helper", layout="wide")
+st.title("PMU Anchor Helper")
+st.caption("The anchor is the SAFEST horse of the race, not a sure thing.")
 
 tab1, tab2 = st.tabs(["Race picker", "Back-test"])
 
@@ -129,10 +147,10 @@ with tab1:
     reunion = labels[choice]
     r_num = reunion["numOfficiel"]
 
-    courses = reunion.get("courses", [])
     c_labels = {}
-    for co in courses:
-        c_labels[f"C{co['numOrdre']} - {co.get('libelle', '')} ({co.get('nombreDeclaresPartants', '?')} horses)"] = co
+    for co in reunion.get("courses", []):
+        name = f"C{co['numOrdre']} - {co.get('libelle', '')} ({co.get('nombreDeclaresPartants', '?')} horses)"
+        c_labels[name] = co
 
     c_choice = st.selectbox("Race (C)", list(c_labels.keys()))
     c_num = c_labels[c_choice]["numOrdre"]
@@ -141,15 +159,22 @@ with tab1:
     if df.empty:
         st.warning("No runners found.")
     else:
-        st.subheader("Top 3 suggested for PLACE")
-        st.dataframe(df.head(3), use_container_width=True)
+        anchor = df.iloc[0]
+        label = confidence_label(df)
+        st.success(f"ANCHOR (safest): number {anchor['Number']} - {anchor['Horse']}")
+        st.write(f"Safety score {anchor['Safety']} / 100 - {label}")
+
+        st.subheader("Partners for a Couple Place (pick one)")
+        st.dataframe(df.iloc[1:3], use_container_width=True)
+
         st.subheader("All runners")
         st.dataframe(df, use_container_width=True)
-        st.caption("A suggestion, not a guarantee.")
+        st.caption("Safest, not certain. Skip races marked WEAK.")
 
 with tab2:
-    st.write("Tests how often the top pick finished in the top 3 on past days.")
+    st.write("How often did the safest horse finish in the top 3 on past days?")
     days_back = st.slider("Days back", 3, 60, 14)
+    only_strong = st.checkbox("Count only STRONG and OK anchors", value=True)
     if st.button("Run back-test"):
         hits, total = 0, 0
         bar = st.progress(0.0)
@@ -167,14 +192,15 @@ with tab2:
                         df = rank_race(d, rn, cn)
                         if df.empty:
                             continue
-                        pick = df.iloc[0]["Number"]
+                        if only_strong and confidence_label(df).startswith("WEAK"):
+                            continue
                         total += 1
-                        if pick in top3:
+                        if df.iloc[0]["Number"] in top3:
                             hits += 1
             except Exception:
                 pass
             bar.progress(i / days_back)
         if total:
-            st.success(f"Top pick placed {hits} of {total} races = {100*hits/total:.1f}%")
+            st.success(f"Anchor placed {hits} of {total} races = {100*hits/total:.1f}%")
         else:
             st.warning("No finished races found.")
